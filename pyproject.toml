@@ -1,0 +1,17 @@
+[project]
+name = "myqqbot"
+version = "0.1.0"
+description = "QQ 群消息 AI 审核机器人：NoneBot2 + OneBot v11 (NapCat) + 零样本分类，自动拦截违规消息，附 WebUI 审核控制台与插件系统"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "nonebot-adapter-console>=0.10.0",
+    "nonebot2[fastapi]>=2.5.0",
+    "nonebot-adapter-onebot",
+    "transformers>=5.9.0",
+    "torch",
+    "tiktoken>=0.13.0",
+    "sentencepiece>=0.2.1",
+    "protobuf>=7.35.0",
+]
+
