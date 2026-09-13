@@ -58,8 +58,14 @@ uv sync
 
 ### 2. `.env`
 
+复制 `.env.example` 为 `.env` 并填入实际值：
+
+```bash
+cp .env.example .env
+```
+
 ```ini
-DRIVER=fastapi
+DRIVER=~fastapi
 HOST=0.0.0.0
 ONEBOT_PORT=28269
 ONEBOT_ACCESS_TOKEN=你的token
