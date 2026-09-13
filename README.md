@@ -1,5 +1,7 @@
 # myQQbot
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 QQ 群消息 AI 审核机器人：基于 **NoneBot2 + OneBot v11 (NapCat)**，使用 HuggingFace 零样本分类模型（`joeddav/xlm-roberta-large-xnli`）对群消息做合规审核，自动删除违规消息、记录涉嫌消息，并提供 WebUI 审核控制台。
 
 ## 功能
