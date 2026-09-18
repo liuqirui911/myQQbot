@@ -9,6 +9,8 @@
 - handler 签名为 async def handler(bot, event)，event 为 OneBot v11 事件对象。
 - 可用 ctx.bot / ctx.classifier / ctx.classify / ctx.webui / ctx.config /
   ctx.candidate_labels / ctx.safe_labels / ctx.threshold 访问机器人能力。
+- 推理框架也可由插件重写：ctx.register_classifier / set_classifier / use_classifier
+  / list_classifiers（示例见 inference_backend.py）。
 """
 
 
@@ -19,11 +21,11 @@ def register(ctx):
         group_id = getattr(event, "group_id", None)
         message_id = getattr(event, "message_id", None)
         print(f"[message_handler] 收到消息 来自 {user_id} (群 {group_id}): {message} | msg_id={message_id}")
-        # 演示 ctx.classify：用当前候选标签做零样本分类（热重载后自动用新标签）
+        # 演示 ctx.classify：用当前推理框架做分类（热重载后自动用新标签；分数可能为 None）
         if message.strip():
             try:
                 r = ctx.classify(message)
-                print(f"[message_handler] 分类: {r['label']} (score={r['score']:.2f}, block={r['block']})")
+                print(f"[message_handler] 分类: {r['label']} (score={r['score']}, block={r['block']})")
             except Exception as e:
                 print(f"[message_handler] 分类失败: {e}")
 

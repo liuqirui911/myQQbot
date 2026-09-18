@@ -7,6 +7,23 @@
 ## 示例列表
 - `message_handler.py` — 函数式插件：打印所有消息 + 演示 `ctx.classify` / `ctx.on_event`
 - `mixin_demo.py` — 类式插件：演示 `PluginMixin`（`send_group` / `on_hook` 等）
+- `inference_backend.py` — 重写模型推理框架：用关键词规则接管默认 HF 模型（不下载、不占显存），含运行时可切换框架的演示
+
+## 重写模型推理框架速查
+框架 = 可调用对象 `fn(text, labels)`，同步 / 异步（`async def`）都支持，返回值支持
+`{'labels','scores'}`（HF 原生）/ `{'label','score'[, 'block']}` / `'标签名'` / `('标签名', 0.9)` / `None`（放行）。
+
+| 需求 | 写法 |
+|---|---|
+| 接管默认框架（默认 HF 模型不再加载） | `ctx.register_classifier(factory, name="x", priority=1)` |
+| 只注册成备用框架，之后切换 | `ctx.register_classifier(factory, priority=0)` + `ctx.use_classifier("x")` |
+| 已有实例直接替换 | `ctx.set_classifier(fn, name="manual")` |
+| 查看已注册框架 | `ctx.list_classifiers()` |
+| 分类 | `ctx.classify(text)`（同步）/ `await ctx.aclassify(text)`（异步框架必须用这个） |
+
+- 工厂惰性调用：只有在首次真正分类时才构建框架实例
+- 默认框架优先级 0，插件框架 `priority>0` 且高于当前激活框架时自动接管
+- `use_classifier` / `set_classifier` 之后会固定选择，不再按优先级自动切换
 
 ## 钩子（hook）速查
 通过 `ctx.on_hook(name, handler)` 拦截机器人核心逻辑：

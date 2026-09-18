@@ -50,16 +50,29 @@ def _pick_device() -> tuple[int, str]:
     desc = f"cuda:{best_i} ({torch.cuda.get_device_name(best_i)}, 空闲 {best_free/2**30:.1f}GiB)"
     return best_i, desc
 
-_device, _device_desc = _pick_device()
-print(f"[AI] 推理设备: {_device_desc}")
 
-classifier = pipeline(
-    "zero-shot-classification",
-    model="joeddav/xlm-roberta-large-xnli",
-    cache_dir="model_cache",
-    device=_device,
-    hypothesis_template="这条消息是{}的。",
-)
+_default_classifier = None
+
+def build_default_classifier():
+    """构建默认模型推理框架（HuggingFace 零样本分类 pipeline）。
+
+    **惰性构建**：只有真正需要分类时才调用。
+    插件若通过 ctx.register_classifier(factory, priority>0) 重写了推理框架，
+    这里永远不会被调用 —— 默认模型不会被下载/加载，也不占显存。
+    """
+    global _default_classifier
+    if _default_classifier is None:
+        device, desc = _pick_device()
+        print(f"[AI] 推理设备: {desc}")
+        print("[AI] 加载默认推理框架: joeddav/xlm-roberta-large-xnli")
+        _default_classifier = pipeline(
+            "zero-shot-classification",
+            model="joeddav/xlm-roberta-large-xnli",
+            cache_dir="model_cache",
+            device=device,
+            hypothesis_template="这条消息是{}的。",
+        )
+    return _default_classifier
 
 # ================== 从 labels.txt 加载标签（支持 WebUI 热重载） ==================
 current_dir = os.path.abspath(os.getcwd())
@@ -115,19 +128,30 @@ def reload_labels() -> None:
 # 注册标签热重载回调（WebUI 保存标签时调用）
 webui.register_labels_reload(reload_labels)
 
-# ================== 同步分类函数 ==================
-def classify_sync(text: str) -> dict:
-    result = classifier(text, candidate_labels)
-    # result: {'sequence': ..., 'labels': [...], 'scores': [...]}
-    top_label = result["labels"][0]
-    top_score = result["scores"][0]
+# ================== 分类函数（走当前模型推理框架，插件可重写） ==================
+class _LazyClassifier:
+    """`classifier(text, labels)` 的惰性代理：转发到当前激活的推理框架。
 
-    block = (top_score > threshold) and (top_label not in safe_labels)
-    return {
-        "block": block,
-        "label": top_label,
-        "score": top_score,
-    }
+    保留该名字只为向后兼容（插件应优先用 ctx.classifier / ctx.classify）。
+    插件重写推理框架后，这里会自动转发到插件的框架。
+    """
+    def __call__(self, text, labels=None, **kwargs):
+        backend = plugin_manager.classifier
+        return backend(text, candidate_labels if labels is None else labels, **kwargs)
+
+    def __repr__(self):
+        return f"<LazyClassifier {plugin_manager.classifier_name}>"
+
+    def __str__(self):
+        return self.__repr__()
+
+
+classifier = _LazyClassifier()
+
+
+def classify_sync(text: str) -> dict:
+    """用当前推理框架分类，返回 {'block','label','score'}"""
+    return plugin_manager.classify(text)
 
 # ================== NoneBot 初始化 ==================
 nonebot.init(_env_file=".env")
@@ -152,8 +176,12 @@ nonebot.get_app().include_router(webui.router)
 # ================== 插件系统 ==================
 # 插件管理器：加载 plugins/ 目录下的插件，负责事件分发与钩子执行
 # 传入当前运行模块（__main__）供 ctx.classify / 标签 / 阈值读取实时值（热重载后自动更新）
+# 推理框架惰性构建：插件可用 ctx.register_classifier(..., priority>0) 重写（此时默认模型不会加载）
 plugin_manager = plugin_loader.PluginManager(
-    classifier=classifier, webui=webui, config=driver.config, main=sys.modules[__name__]
+    webui=webui, config=driver.config, main=sys.modules[__name__],
+    default_classifier_factory=build_default_classifier,
+    default_classifier_name="hf-zero-shot",
+    default_classifier_description="HuggingFace 零样本分类 (joeddav/xlm-roberta-large-xnli)",
 )
 plugin_manager.load()
 
@@ -175,8 +203,12 @@ else:
 # ================== 预热 ==================
 @driver.on_startup
 async def warmup():
-    await anyio.to_thread.run_sync(classify_sync, "预热消息")
-    print("[AI] Model warmed up and ready.")
+    """预热当前推理框架（插件重写的框架同样会被预热；失败不阻断启动）"""
+    try:
+        await plugin_manager.aclassify("预热消息")
+        print(f"[AI] Model warmed up and ready. (框架: {plugin_manager.classifier_name})")
+    except Exception as e:
+        print(f"[AI] 预热失败，推理框架将在首次分类时初始化: {e}")
 
 # ================== WebUI 初始化 + 定时清理 ==================
 @driver.on_startup

@@ -17,5 +17,10 @@ audit.db
 *.log
 model_cache/
 
+# 本地专用：Intel NPU 推理插件（不公开到 GitHub），及其 IR 缓存
+plugins/npu*.py
+npu_local/
+model_cache_npu/
+
 # 外部文档仓库（独立项目，不随本仓库提交）
 NapCatDocs/

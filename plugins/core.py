@@ -6,9 +6,11 @@
 
 main.py 只负责事件分发与执行动作（删除 / 记录），审核"决策"逻辑都在这里。
 删除本插件（或移出 plugins/）后，机器人将不再做任何 AI 审核。
-"""
-import anyio
 
+审核用的推理框架来自 `ctx`（main.py 的默认 HF 模型，或被其他插件重写的框架，
+如 `plugin_example/inference_backend.py`）。这里统一用 `await self.aclassify(text)`，
+因此同步 / 异步推理框架都能直接工作。
+"""
 from plugin_loader import PluginMixin
 
 
@@ -32,11 +34,13 @@ class CoreAuditPlugin(PluginMixin):
             print(f"[AI] Too short, pass: {text}")
             return {"block": False, "label": None, "score": None}
         try:
-            # 在线程池跑推理，避免阻塞事件循环
-            result = await anyio.to_thread.run_sync(self.classify, text)
-            print(f"[AI] Checked: '{text[:30]}...' -> label: {result['label'] or 'None'}, score: {result['score']:.2f}, block: {result['block']}")
+            # 走当前推理框架（插件可重写；同步框架自动放线程池，异步框架直接 await）
+            result = await self.aclassify(text)
+            score = result.get("score")
+            score_txt = f"{score:.2f}" if isinstance(score, (int, float)) else "None"
+            print(f"[AI] Checked: '{text[:30]}...' -> label: {result['label'] or 'None'}, score: {score_txt}, block: {result['block']}")
             if result["block"]:
-                print(f"[AI] Blocked: {result['label']} (score={result['score']:.2f}) - '{text[:50]}...'")
+                print(f"[AI] Blocked: {result['label']} (score={score_txt}) - '{text[:50]}...'")
             return result
         except Exception as e:
             print(f"[AI Check Error] {e}")

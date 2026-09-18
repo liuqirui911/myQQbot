@@ -12,19 +12,21 @@ QQ 群消息 AI 审核机器人：基于 **NoneBot2 + OneBot v11 (NapCat)**，�
 - **加群请求自动审批**：申请留言含关键词（验证/申请/进群/hello/hi）自动通过
 - **WebUI 审核控制台**：审核日志查询/搜索/批量操作、标签管理（保存即热重载）、NapCat 连接状态、一键重启
 - **插件系统**：消息处理器、全事件处理器、核心逻辑钩子（hook），支持函数式与类式（Mixin）两种写法
+- **推理框架可重写**：插件可注册同步/异步的分类框架接管默认模型（接管后默认 HF 模型不再加载）
 - **自动 GPU/CPU 选择**：多卡时挑空闲显存最多的 GPU，无 CUDA 回退 CPU
 
 ## 目录结构
 
 ```
-main.py              # 框架入口：事件分发、白名单过滤、执行动作（删/记/批）、插件加载
-plugin_loader.py     # 插件系统：PluginContext / PluginMixin / PluginManager
+main.py              # 框架入口：事件分发、白名单过滤、执行动作（删/记/批）、插件加载、默认推理框架
+plugin_loader.py     # 插件系统：PluginContext / PluginMixin / PluginManager / ClassifierRegistry
 webui.py             # WebUI：FastAPI 路由 + 页面模板（Cloudflare 风格）
 plugins/
   core.py            # 核心审核插件：AI 审核 + 加群审批（通过钩子接入）
 plugin_example/      # 示例插件（不被自动加载，复制到 plugins/ 即启用）
   message_handler.py #   函数式示例
   mixin_demo.py      #   类式示例（PluginMixin + hook）
+  inference_backend.py # 重写模型推理框架示例（接管后不加载 HF 模型）
   README.md          #   插件 API / 钩子速查
 labels.txt           # 候选标签（每行一个）
 safe_labels.txt      # 安全标签（命中不拦截）
@@ -45,7 +47,7 @@ NapCatDocs/          # NapCat 官方文档（本地副本）
 uv sync
 ```
 
-首次启动会自动下载分类模型到 `model_cache/`（约 1.3GB）。
+首次启动会自动下载分类模型到 `model_cache/`（约 1.3GB，惰性下载：若插件重写了推理框架则不会下载）。
 
 ## 配置
 
@@ -90,7 +92,7 @@ GROUP_WHITELIST=544514362
 uv run main.py
 ```
 
-启动日志会打印推理设备（GPU/CPU）、模型预热、WebUI 地址。
+启动日志会打印推理框架 / 推理设备（GPU/CPU）、模型预热、WebUI 地址。
 
 - WebUI：`http://127.0.0.1:28269/webui`（审核日志）
 - 标签管理：`http://127.0.0.1:28269/webui/labels`
@@ -139,8 +141,14 @@ class MyPlugin(PluginMixin):
 | 成员 | 说明 |
 |---|---|
 | `ctx.bot` | 机器人实例（连接后可用）：`send_msg` / `delete_msg` / `call_api` 等 |
-| `ctx.classifier` | 零样本分类 pipeline |
-| `ctx.classify(text)` | 便捷分类，返回 `{'label', 'score', 'block'}` |
+| `ctx.classifier` | 当前推理框架（默认是零样本分类 pipeline，可被插件重写） |
+| `ctx.classifier_name` | 当前推理框架名（不触发构建） |
+| `ctx.classify(text)` | 同步分类，返回 `{'label', 'score', 'block'}` |
+| `ctx.aclassify(text)` | 异步分类（同步框架自动放线程池，异步框架直接 await） |
+| `ctx.set_classifier(fn)` | 用已有实例直接替换推理框架（立即生效） |
+| `ctx.register_classifier(factory, name=, priority=)` | 注册推理框架（`priority>0` 且最高者自动接管默认框架） |
+| `ctx.use_classifier(name)` | 切换推理框架 |
+| `ctx.list_classifiers()` | 列出已注册框架（名称/来源/优先级/是否激活） |
 | `ctx.webui` | webui 模块：`record_message` / `get_labels` 等 |
 | `ctx.config` | `.env` 配置对象 |
 | `ctx.candidate_labels` / `ctx.safe_labels` / `ctx.threshold` | 当前标签与阈值（热重载后自动更新） |
@@ -159,6 +167,46 @@ class MyPlugin(PluginMixin):
 | `before_request(bot, event)` | 加群请求审批前 | `True/False` 覆盖审批决定 |
 
 钩子按注册顺序执行，第一个返回有效值的短路后续；单个插件异常只打印不影响其他。
+
+### 重写模型推理框架
+
+插件可以完全接手机器人的"分类"环节（比如换成 ONNX / llama.cpp / 外部 LLM 审核 API / 纯规则引擎）。
+框架就是一个可调用对象 `fn(text, labels)`，返回值支持：
+
+```python
+{'labels': [...], 'scores': [...]}   # HF pipeline 原生格式（取 top1）
+{'label': 'x', 'score': 0.9}         # 精简格式（可带 'block' 显式覆盖拦截判定）
+'标签名' / ('标签名', 0.9) / {'标签A': 0.1, '标签B': 0.9} / None  # None = 放行
+```
+
+```python
+# plugins/my_backend.py —— 用规则引擎替换默认 HF 模型（不下载、不占显存）
+def keyword_backend():
+    def classify(text, labels):
+        return {"label": "宣传违规工具", "score": 0.99} if "外挂" in text else None
+    return classify
+
+def register(ctx):
+    ctx.register_classifier(keyword_backend, name="keyword", priority=10,
+                            description="关键词规则引擎")
+```
+
+| 场景 | 写法 |
+|---|---|
+| 替换默认框架（默认 HF 模型不再加载） | `ctx.register_classifier(factory, priority=1)`（默认值就是 1，且 > 默认框架的 0） |
+| 只注册成备用框架，之后切换 | `ctx.register_classifier(factory, priority=0)` + `ctx.use_classifier(name)` |
+| 已有实例直接替换 | `ctx.set_classifier(fn, name="manual")` |
+| 查看已注册框架 | `ctx.list_classifiers()` |
+
+要点：
+
+- **惰性构建**：工厂只在首次真正分类时调用，所以插件接管后默认模型不会被下载/加载
+- **同步 / 异步都行**：`async def classify(text, labels)` 也可以，此时只能用 `await ctx.aclassify(text)`
+  （`ctx.classify` 是同步接口，遇到异步框架会抛 `RuntimeError` 提示）
+- **优先级**：默认框架优先级 0；插件框架 `priority>0` 且高于当前激活框架时自动接管；
+  `use_classifier` / `set_classifier` 之后会"固定"选择，不再自动切换
+- 插件的 `register(ctx)` 里注册即可：日志会打印 `[Plugins] 推理框架: <名称> (来源: <插件文件>)`
+- 完整示例见 `plugin_example/inference_backend.py`（含运行时可切换框架的演示）
 
 更多示例见 `plugin_example/`。
 

@@ -19,6 +19,16 @@
   （send_group / send_private / delete / call_api / classify / record 等）。
 - 钩住核心逻辑：通过 ctx.on_hook(name, handler) 注册钩子处理器，拦截机器人审核流程：
     before_check / after_check / before_delete / after_block / before_request
+- 重写模型推理框架：插件可以接管/替换分类器（同步、异步后端都支持）：
+    ctx.register_classifier(factory, name="my-backend", priority=1)  # priority>0 且最高者自动接管默认框架
+    ctx.set_classifier(instance)                                     # 用已有实例直接替换
+    ctx.use_classifier("my-backend")                                 # 在多个框架之间切换
+    ctx.list_classifiers()                                           # 查看已注册框架（来源 / 优先级 / 是否激活）
+  框架签名：fn(text, labels) -> 下列任意一种返回值
+    {'labels': [...], 'scores': [...]}   HF pipeline 原生格式（取 top1）
+    {'label': 'x', 'score': 0.9}         精简格式（可带 'block' 显式覆盖拦截判定）
+    '标签名' / ('标签名', 0.9) / {'标签A': 0.1, '标签B': 0.9} / None（放行）
+  框架为惰性构建：被插件接管后，main.py 的默认 HuggingFace 模型不会被加载（不下载、不占显存）。
 - 单个插件加载失败只打印错误并跳过，不影响机器人启动。
 """
 import asyncio
@@ -29,19 +39,233 @@ import sys
 
 PLUGINS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
 
+# 默认推理框架的注册名（main.py 提供，可被插件重写）
+DEFAULT_CLASSIFIER_NAME = "default"
+
+
+def _to_float(value):
+    """宽松转 float，失败返回 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_async_callable(fn) -> bool:
+    """判断可调用对象是否为 async（含 async __call__ 与 functools.partial 包装）。"""
+    if inspect.iscoroutinefunction(fn):
+        return True
+    return inspect.iscoroutinefunction(getattr(fn, "__call__", None))
+
+
+def normalize_classify_result(result, threshold, safe_labels) -> dict:
+    """把推理框架的返回值统一成 {'label', 'score', 'block'}。
+
+    可接受的返回值：
+    - {'labels': [...], 'scores': [...]}   HF pipeline 原生格式（取 top1）
+    - {'label': 'x', 'score': 0.9}         精简格式（可额外带 'block' 覆盖判定）
+    - {'标签A': 0.1, '标签B': 0.9}         标签 -> 得分映射（取最大）
+    - ('标签A', 0.9) / ['标签A', 0.9]      二元组
+    - '标签A'                              字符串（视为得分 1.0）
+    - None / 空                            放行
+    block 未显式给出时 = score > threshold 且 label 不在 safe_labels。
+    """
+    label, score, block = None, None, None
+
+    if isinstance(result, dict):
+        if "labels" in result and "scores" in result:
+            labels = result.get("labels") or []
+            scores = result.get("scores") or []
+            if labels:
+                label = str(labels[0])
+                if scores:
+                    score = _to_float(scores[0])
+        elif "label" in result or "score" in result:
+            raw_label = result.get("label")
+            label = None if raw_label is None else str(raw_label)
+            score = _to_float(result.get("score"))
+            if result.get("block") is not None:
+                block = bool(result["block"])
+        else:
+            numeric = {str(k): _to_float(v) for k, v in result.items()}
+            numeric = {k: v for k, v in numeric.items() if v is not None}
+            if numeric:
+                label = max(numeric, key=numeric.get)
+                score = numeric[label]
+    elif isinstance(result, str):
+        label, score = result, 1.0
+    elif isinstance(result, (tuple, list)) and len(result) == 2:
+        label = None if result[0] is None else str(result[0])
+        score = _to_float(result[1])
+
+    if label is None:
+        return {"label": None, "score": score, "block": False}
+    if block is None:
+        block = (score is not None) and (score > threshold) and (label not in safe_labels)
+    return {"label": label, "score": score, "block": bool(block)}
+
+
+class ClassifierRegistry:
+    """模型推理框架注册表：默认框架 + 插件注册的框架，按优先级自动激活。
+
+    - 注册：register(name, factory, ...)，factory 为无参可调用对象，返回分类器实例
+    - 激活：priority > 0 且高于当前激活框架时自动接管默认框架；
+            显式 use() / set() 会固定选择（之后不再按优先级自动切换）
+    - 惰性：factory 只在首次真正分类时调用。因此插件接管后，
+            默认的 HuggingFace 模型不会被加载（不下载、不占显存）。
+    """
+
+    def __init__(self, default_factory=None, default_name=DEFAULT_CLASSIFIER_NAME,
+                 default_description="默认推理框架", default_provider="main"):
+        self._backends: dict = {}
+        self._instances: dict = {}
+        self._active: str | None = None
+        self._pinned = False  # 被 use()/set() 固定后不再自动切换
+        self.register(default_name, default_factory, priority=0,
+                      description=default_description, provider=default_provider, is_default=True)
+
+    # ---------- 注册 / 切换 ----------
+    def register(self, name, factory, priority=0, description="", provider=None, is_default=False):
+        """注册（或覆盖）一个推理框架。"""
+        if not isinstance(name, str) or not name:
+            raise ValueError("推理框架名称必须是非空字符串")
+        if factory is not None and not callable(factory):
+            raise TypeError("factory 必须是无参可调用对象（返回分类器实例）")
+        old = self._backends.get(name)
+        if old is not None and old.get("factory") is not factory:
+            self._instances.pop(name, None)  # 工厂变了，丢弃旧实例
+        priority = int(priority)
+        self._backends[name] = {
+            "factory": factory,
+            "priority": priority,
+            "description": description,
+            "provider": provider,
+            "is_default": bool(is_default),
+        }
+        if self._active is None:
+            self._active = name
+        elif (not self._pinned and not is_default and priority > 0
+              and priority > self._backends[self._active]["priority"]):
+            self._active = name  # 插件框架自动接管
+        return name
+
+    def set(self, name, instance, description="", provider=None):
+        """用已有实例直接替换/新增框架：立即生效并固定，不再自动切换。"""
+        if not callable(instance):
+            raise TypeError("instance 必须是可调用对象")
+        self._backends[name] = {
+            "factory": (lambda: instance),
+            "priority": 999,
+            "description": description,
+            "provider": provider,
+            "is_default": False,
+        }
+        self._instances[name] = instance
+        self._active = name
+        self._pinned = True
+        return instance
+
+    def use(self, name):
+        """切换当前激活框架（立即构建，工厂报错会直接抛出）。"""
+        if name not in self._backends:
+            raise KeyError(f"未注册的推理框架: {name!r}（已注册: {sorted(self._backends)}）")
+        self._active = name
+        self._pinned = True
+        return self._build(name)
+
+    def unregister(self, name) -> bool:
+        """移除框架；若移除的是当前激活框架，回退到剩余中优先级最高者。"""
+        if name not in self._backends:
+            return False
+        self._backends.pop(name, None)
+        self._instances.pop(name, None)
+        if self._active == name:
+            self._pinned = False
+            self._active = max(
+                self._backends, key=lambda n: self._backends[n]["priority"], default=None
+            )
+        return True
+
+    # ---------- 取用 ----------
+    def current_name(self):
+        """当前激活框架的名称（不触发构建）"""
+        return self._active
+
+    def current(self):
+        """当前激活框架实例（首次访问时才构建）"""
+        if self._active is None:
+            raise RuntimeError("没有可用的推理框架（可用 ctx.register_classifier 注册一个）")
+        return self._build(self._active)
+
+    def _build(self, name):
+        if name in self._instances:
+            return self._instances[name]
+        info = self._backends.get(name)
+        if info is None:
+            raise KeyError(f"未注册的推理框架: {name!r}")
+        factory = info["factory"]
+        if factory is None:
+            raise RuntimeError(f"推理框架 {name!r} 未提供构建工厂")
+        instance = factory()
+        if not callable(instance):
+            raise TypeError(f"推理框架 {name!r} 的工厂未返回可调用对象: {instance!r}")
+        self._instances[name] = instance
+        print(f"[Plugins] 推理框架已就绪: {name} (来源: {info.get('provider') or 'unknown'})")
+        return instance
+
+    def describe(self) -> list:
+        """列出所有已注册框架（不触发构建）。"""
+        return [
+            {
+                "name": n,
+                "active": n == self._active,
+                "priority": i["priority"],
+                "provider": i["provider"],
+                "description": i["description"],
+                "built": n in self._instances,
+                "is_default": i["is_default"],
+            }
+            for n, i in self._backends.items()
+        ]
+
+    def names(self) -> list:
+        """所有已注册框架的名称"""
+        return list(self._backends)
+
 
 class PluginContext:
     """传给插件 register(ctx) 的上下文对象。"""
 
-    def __init__(self, classifier=None, webui=None, config=None, main=None):
+    def __init__(self, classifier=None, webui=None, config=None, main=None,
+                 classifier_registry=None, default_classifier_factory=None,
+                 default_classifier_name=DEFAULT_CLASSIFIER_NAME,
+                 default_classifier_description="默认推理框架"):
         self._bot = None
-        self._classifier = classifier
         self._webui = webui
         self._config = config
         self._main = main
+        self._loading_plugin = None  # 插件加载期间由 PluginManager 写入（用于推理框架溯源）
         self._message_handlers: list = []
         self._event_handlers: list = []
         self._hooks: dict = {}
+
+        # ---- 模型推理框架注册表（插件可重写） ----
+        if classifier_registry is not None:
+            self._registry = classifier_registry
+        else:
+            self._registry = ClassifierRegistry(
+                default_factory=default_classifier_factory,
+                default_name=default_classifier_name,
+                default_description=default_classifier_description,
+            )
+        if classifier is not None:
+            # 兼容旧接口：外部直接传入已构建好的分类器实例（惰性返回该实例）
+            self._registry.register(
+                default_classifier_name, (lambda: classifier), priority=0,
+                description=default_classifier_description, provider="main", is_default=True,
+            )
 
     @property
     def bot(self):
@@ -56,8 +280,15 @@ class PluginContext:
 
     @property
     def classifier(self):
-        """零样本分类 pipeline，用法: classifier(text, labels) -> {'labels': [...], 'scores': [...]}"""
-        return self._classifier
+        """当前激活的推理框架（可调用对象，插件可通过 ctx.set_classifier / ctx.register_classifier 重写）。
+        默认是 HF 零样本分类 pipeline，用法: classifier(text, labels) -> {'labels': [...], 'scores': [...]}
+        惰性构建：首次访问时才创建（插件接管后默认模型不会被加载）。"""
+        return self._registry.current()
+
+    @property
+    def classifier_name(self):
+        """当前激活的推理框架名称（不触发构建）"""
+        return self._registry.current_name()
 
     @property
     def webui(self):
@@ -84,18 +315,76 @@ class PluginContext:
         """当前拦截阈值"""
         return self._main.threshold if self._main else 0.7
 
+    # ---- 分类（走当前推理框架，可被插件重写） ----
     def classify(self, text: str) -> dict:
-        """用当前候选标签对文本做零样本分类（同步，勿在事件循环中阻塞调用大文本）。
-        返回 {'label': str, 'score': float, 'block': bool}，
-        block = score > threshold 且 label 不在安全标签中。"""
-        result = self._classifier(text, self.candidate_labels)
-        label = result["labels"][0]
-        score = result["scores"][0]
-        return {
-            "label": label,
-            "score": score,
-            "block": (score > self.threshold) and (label not in self.safe_labels),
-        }
+        """用当前推理框架对文本分类（同步，勿在事件循环中阻塞调用大文本）。
+        返回 {'label': str|None, 'score': float|None, 'block': bool}，
+        block = score > threshold 且 label 不在安全标签中（框架可显式返回 block 覆盖）。
+        若当前框架是 async 的，请改用 `await ctx.aclassify(text)`。"""
+        backend = self._registry.current()
+        if _is_async_callable(backend):
+            raise RuntimeError(
+                f"当前推理框架 {self._registry.current_name()!r} 是异步的，"
+                "请改用 `await ctx.aclassify(text)`"
+            )
+        raw = backend(text, self.candidate_labels)
+        return normalize_classify_result(raw, self.threshold, self.safe_labels)
+
+    async def aclassify(self, text: str) -> dict:
+        """异步分类：同步框架放到线程池执行，异步框架直接 await。
+        返回结构与 ctx.classify 相同。"""
+        backend = self._registry.current()
+        if _is_async_callable(backend):
+            raw = await backend(text, self.candidate_labels)
+        else:
+            raw = await asyncio.to_thread(backend, text, self.candidate_labels)
+        return normalize_classify_result(raw, self.threshold, self.safe_labels)
+
+    # ---- 模型推理框架：重写 / 注册 / 切换 ----
+    def set_classifier(self, classifier, name=None, description="", provider=None):
+        """用已有实例直接替换当前推理框架（立即生效并固定，之后不再按优先级自动切换）。
+
+        参数 classifier 为任意可调用对象: fn(text, labels) -> 结果
+        （结果格式见模块文档：HF 格式 / {'label','score'} / '标签名' / None 均支持）。
+        """
+        if not callable(classifier):
+            raise TypeError("classifier 必须是可调用对象")
+        n = name or getattr(classifier, "__name__", None) or "plugin-classifier"
+        provider = provider or self._loading_plugin or "plugin"
+        self._registry.set(n, classifier,
+                           description=description or f"{provider} 提供的推理框架",
+                           provider=provider)
+        print(f"[Plugins] 推理框架已被 {provider} 重写: {n}")
+        return classifier
+
+    def register_classifier(self, factory, name=None, priority=1, description="", provider=None):
+        """注册一个推理框架工厂（惰性构建：真正分类时才调用 factory()）。
+
+        priority > 0 且高于当前激活框架时会自动接管默认框架 —— main.py 的默认
+        HuggingFace 模型不会被加载（不下载、不占显存）。
+        只想注册成"备用框架"（之后用 ctx.use_classifier 切换）请传 priority=0。
+        """
+        if not callable(factory):
+            raise TypeError("factory 必须是无参可调用对象")
+        n = name or getattr(factory, "__name__", None) or "plugin-backend"
+        provider = provider or self._loading_plugin or "plugin"
+        self._registry.register(n, factory, priority=priority,
+                                description=description, provider=provider)
+        return n
+
+    def use_classifier(self, name):
+        """切换到指定推理框架（立即构建，工厂报错会直接抛出）"""
+        instance = self._registry.use(name)
+        print(f"[Plugins] 推理框架已切换: {name}")
+        return instance
+
+    def unregister_classifier(self, name) -> bool:
+        """移除某个推理框架；移除的是当前框架时回退到剩余中优先级最高者。"""
+        return self._registry.unregister(name)
+
+    def list_classifiers(self) -> list:
+        """列出所有已注册的推理框架（名称 / 来源 / 优先级 / 是否激活 / 是否已构建）"""
+        return self._registry.describe()
 
     def on_message(self, handler):
         """注册消息处理器。handler 为 async def handler(bot, event) 或同步函数。
@@ -185,6 +474,10 @@ class PluginMixin:
         return self.ctx.classifier
 
     @property
+    def classifier_name(self):
+        return self.ctx.classifier_name
+
+    @property
     def webui(self):
         return self.ctx.webui
 
@@ -225,6 +518,26 @@ class PluginMixin:
     def classify(self, text):
         return self.ctx.classify(text)
 
+    async def aclassify(self, text):
+        return await self.ctx.aclassify(text)
+
+    # ---- 模型推理框架（可重写） ----
+    def set_classifier(self, classifier, name=None, description=""):
+        """用已有实例直接替换当前推理框架"""
+        return self.ctx.set_classifier(classifier, name=name, description=description)
+
+    def register_classifier(self, factory, name=None, priority=1, description=""):
+        """注册推理框架工厂（priority>0 且最高者自动接管默认框架）"""
+        return self.ctx.register_classifier(factory, name=name, priority=priority, description=description)
+
+    def use_classifier(self, name):
+        """切换到指定推理框架"""
+        return self.ctx.use_classifier(name)
+
+    def list_classifiers(self):
+        """列出所有已注册的推理框架"""
+        return self.ctx.list_classifiers()
+
     # ---- 审核记录 ----
     def record(self, user_id, group_id, message_id, text, label, score, status):
         return self.ctx.webui.record_message(
@@ -240,19 +553,65 @@ class PluginManager:
     """插件管理器：拥有 PluginContext，负责加载插件、分发事件、执行钩子。
 
     用法（main.py）：
-        manager = PluginManager(classifier=..., webui=..., config=..., main=...)
-        manager.load()
-        ...
+        manager = PluginManager(webui=..., config=..., main=...,
+                                default_classifier_factory=build_default_classifier,
+                                default_classifier_name="hf-zero-shot")
+        manager.load()                           # 插件可在此重写推理框架
+        manager.classifier                       # 当前推理框架（惰性构建，插件接管后默认模型不加载）
+        manager.classify(text) / await manager.aclassify(text)
         manager.bot = bot                        # NapCat 连接时注入
         await manager.dispatch_message(bot, ev)  # 分发消息事件
         await manager.dispatch_event(bot, ev)    # 分发全事件
         await manager.run_hook("before_check", bot, ev, text)
     """
 
-    def __init__(self, classifier=None, webui=None, config=None, main=None, plugins_dir=None):
-        self.ctx = PluginContext(classifier=classifier, webui=webui, config=config, main=main)
+    def __init__(self, classifier=None, webui=None, config=None, main=None, plugins_dir=None,
+                 default_classifier_factory=None, default_classifier_name=DEFAULT_CLASSIFIER_NAME,
+                 default_classifier_description="默认推理框架"):
+        self.ctx = PluginContext(
+            classifier=classifier, webui=webui, config=config, main=main,
+            default_classifier_factory=default_classifier_factory,
+            default_classifier_name=default_classifier_name,
+            default_classifier_description=default_classifier_description,
+        )
         self._plugins_dir = plugins_dir or PLUGINS_DIR
         self._loaded: list = []
+
+    # ---- 模型推理框架（插件可重写） ----
+    @property
+    def classifier(self):
+        """当前激活的推理框架（首次访问时才构建）"""
+        return self.ctx.classifier
+
+    @property
+    def classifier_name(self):
+        """当前激活的推理框架名称"""
+        return self.ctx.classifier_name
+
+    def classify(self, text: str) -> dict:
+        """同步分类（框架是 async 时请用 await manager.aclassify(text)）"""
+        return self.ctx.classify(text)
+
+    async def aclassify(self, text: str) -> dict:
+        """异步分类（同步框架自动放线程池）"""
+        return await self.ctx.aclassify(text)
+
+    def set_classifier(self, classifier, name=None, description=""):
+        """用已有实例直接替换当前推理框架"""
+        return self.ctx.set_classifier(classifier, name=name, description=description)
+
+    def register_classifier(self, factory, name=None, priority=1, description=""):
+        """注册推理框架工厂（priority>0 且最高者自动接管默认框架）"""
+        return self.ctx.register_classifier(factory, name=name, priority=priority,
+                                           description=description)
+
+    def use_classifier(self, name):
+        """切换到指定推理框架"""
+        return self.ctx.use_classifier(name)
+
+    def list_classifiers(self) -> list:
+        """列出所有已注册的推理框架"""
+        return self.ctx.list_classifiers()
 
     @property
     def bot(self):
@@ -279,10 +638,12 @@ class PluginManager:
         )
         if not files:
             print("[Plugins] 未发现插件")
+            self._log_classifier_summary()
             return
         for fname in files:
             path = os.path.join(self._plugins_dir, fname)
             name = f"plugins.{fname[:-3]}"
+            self.ctx._loading_plugin = fname  # 供 ctx.register_classifier 溯源
             try:
                 spec = importlib.util.spec_from_file_location(name, path)
                 module = importlib.util.module_from_spec(spec)
@@ -323,7 +684,24 @@ class PluginManager:
                     print(f"[Plugins] 跳过 {fname}: 未定义 register(ctx) 或 PluginMixin 子类")
             except Exception as e:
                 print(f"[Plugins] 加载 {fname} 失败: {e}")
+            finally:
+                self.ctx._loading_plugin = None
         print(f"[Plugins] 共加载 {len(self.ctx._message_handlers)} 个消息处理器, {len(self.ctx._event_handlers)} 个事件处理器")
+        self._log_classifier_summary()
+
+    def _log_classifier_summary(self) -> None:
+        """打印当前推理框架（不触发构建）"""
+        infos = self.ctx.list_classifiers()
+        active = next((i for i in infos if i["active"]), None)
+        if active is None:
+            print("[Plugins] 推理框架: 无（插件可通过 ctx.register_classifier 注册）")
+            return
+        print(f"[Plugins] 推理框架: {active['name']} "
+              f"(来源: {active['provider'] or 'unknown'}, 优先级 {active['priority']}, "
+              f"已构建: {'是' if active['built'] else '否（首次分类时构建）'})")
+        switched = [i["name"] for i in infos if not i["is_default"] and not i["active"]]
+        if switched:
+            print(f"[Plugins] 其他可用推理框架: {switched}（ctx.use_classifier(name) 切换）")
 
     async def dispatch_message(self, bot, event) -> None:
         """按注册顺序调用所有消息处理器，单个异常不影响其他。"""
@@ -354,10 +732,14 @@ class PluginManager:
 manager = PluginManager()
 
 
-def load_plugins(classifier=None, webui=None, config=None, main=None) -> tuple:
+def load_plugins(classifier=None, webui=None, config=None, main=None,
+                 default_classifier_factory=None,
+                 default_classifier_name=DEFAULT_CLASSIFIER_NAME) -> tuple:
     """[兼容旧接口] 创建并加载插件，返回 (消息处理器列表, 事件处理器列表)。
     新代码请直接用 PluginManager。"""
     global manager
-    manager = PluginManager(classifier=classifier, webui=webui, config=config, main=main)
+    manager = PluginManager(classifier=classifier, webui=webui, config=config, main=main,
+                            default_classifier_factory=default_classifier_factory,
+                            default_classifier_name=default_classifier_name)
     manager.load()
     return list(manager.ctx._message_handlers), list(manager.ctx._event_handlers)
